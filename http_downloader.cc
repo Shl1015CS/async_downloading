@@ -8,11 +8,14 @@
 #include <arpa/inet.h>
 #include <string.h>
 #include <stdexcept>
+#include <nghttp2/nghttp2.h>
 
-HttpDownloader::HttpDownloader() : epoll_fd(-1), sock_fd(-1), fp(nullptr) {
+HttpDownloader::HttpDownloader() 
+    : epoll_fd(-1), sock_fd(-1), fp(nullptr), 
+      session(nullptr), is_http2(false) {
     epoll_fd = epoll_create1(0);
     if (epoll_fd == -1) {
-        throw std::runtime_error("创建epoll失败");
+        throw std::runtime_error("creat_epoll_fail");
     }
 }
 
@@ -25,7 +28,7 @@ HttpDownloader::~HttpDownloader() {
 void HttpDownloader::parseUrl(const std::string& url) {
     size_t pos = url.find("://");
     if (pos == std::string::npos) {
-        throw std::runtime_error("URL格式错误");
+        throw std::runtime_error("URL_type_error");
     }
 
     size_t host_start = pos + 3;
@@ -46,12 +49,12 @@ void HttpDownloader::download(const std::string& url, const std::string& output)
     
     struct hostent *he = gethostbyname(host.c_str());
     if (!he) {
-        throw std::runtime_error("无法解析主机名");
+        throw std::runtime_error("can not analyze host");
     }
 
     sock_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
     if (sock_fd == -1) {
-        throw std::runtime_error("创建socket失败");
+        throw std::runtime_error("init_socket_error");
     }
 
     int flags = fcntl(sock_fd, F_GETFL, 0);
@@ -77,7 +80,7 @@ void HttpDownloader::download(const std::string& url, const std::string& output)
 
     fp = fopen(output_file.c_str(), "wb");
     if (!fp) {
-        throw std::runtime_error("无法创建输出文件");
+        throw std::runtime_error("error_fopen");
     }
 
     eventLoop();
@@ -95,23 +98,23 @@ void HttpDownloader::eventLoop() {
         
         if (nfds == -1) {
             if (errno == EINTR) continue;
-            throw std::runtime_error("epoll_wait失败");
+            throw std::runtime_error("epoll_wait_fail");
         }
         
         if (nfds == 0) {
-            throw std::runtime_error("操作超时");
+            throw std::runtime_error("runtime over");
         }
 
         for (int i = 0; i < nfds; i++) {
             if (events[i].events & EPOLLERR || events[i].events & EPOLLHUP) {
-                throw std::runtime_error("socket错误");
+                throw std::runtime_error("socket_fail");
             }
 
             if (events[i].events & EPOLLOUT && !request_sent) {
                 int error = 0;
                 socklen_t len = sizeof(error);
                 if (getsockopt(sock_fd, SOL_SOCKET, SO_ERROR, &error, &len) < 0 || error) {
-                    throw std::runtime_error("连接失败");
+                    throw std::runtime_error("connect_error");
                 }
                 
                 sendRequest();
@@ -132,12 +135,12 @@ void HttpDownloader::eventLoop() {
                         if (errno == EAGAIN || errno == EWOULDBLOCK) {
                             break;
                         }
-                        throw std::runtime_error("读取数据失败");
+                        throw std::runtime_error("read_data_fail");
                     }
                     
                     if (n == 0) {
                         if (!headers_received) {
-                            throw std::runtime_error("连接过早关闭");
+                            throw std::runtime_error("connect_early_close");
                         }
                         return;
                     }
@@ -190,4 +193,64 @@ void HttpDownloader::sendRequest() {
         }
         total += sent;
     }
+}
+
+void HttpDownloader::initHttp2Session() {
+    nghttp2_session_callbacks *callbacks;
+    nghttp2_session_callbacks_new(&callbacks);
+    
+    nghttp2_session_callbacks_set_send_callback(callbacks, sendCallback);
+    nghttp2_session_callbacks_set_on_header_callback(callbacks, onHeaderCallback);
+    nghttp2_session_callbacks_set_on_data_chunk_recv_callback(
+        callbacks, onDataChunkRecvCallback);
+    
+    nghttp2_session_client_new(&session, callbacks, this);
+    nghttp2_session_callbacks_del(callbacks);
+    
+    // 发送连接前言
+    std::string preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+    write(sock_fd, preface.c_str(), preface.length());
+    
+    // 发送设置帧
+    nghttp2_settings_entry iv[1] = {
+        {NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, 100}
+    };
+    nghttp2_submit_settings(session, NGHTTP2_FLAG_NONE, iv, 1);
+}
+
+void HttpDownloader::submitHttp2Request() {
+    const nghttp2_nv hdrs[] = {
+        {(uint8_t*)":method", (uint8_t*)"GET", 6, 3, NGHTTP2_NV_FLAG_NONE},
+        {(uint8_t*)":path", (uint8_t*)path.c_str(), 5, path.length(), NGHTTP2_NV_FLAG_NONE},
+        {(uint8_t*)":scheme", (uint8_t*)"https", 7, 5, NGHTTP2_NV_FLAG_NONE},
+        {(uint8_t*)":authority", (uint8_t*)host.c_str(), 10, host.length(), NGHTTP2_NV_FLAG_NONE}
+    };
+    
+    nghttp2_submit_request(session, NULL, hdrs, 4, NULL, this);
+    nghttp2_session_send(session);
+}
+
+// HTTP/2 回调函数实现
+ssize_t HttpDownloader::sendCallback(nghttp2_session *session, const uint8_t *data,
+                                   size_t length, int flags, void *user_data) {
+    HttpDownloader *downloader = static_cast<HttpDownloader*>(user_data);
+    return write(downloader->sock_fd, data, length);
+}
+
+int HttpDownloader::onHeaderCallback(nghttp2_session *session,
+                                   const nghttp2_frame *frame,
+                                   const uint8_t *name, size_t namelen,
+                                   const uint8_t *value, size_t valuelen,
+                                   uint8_t flags, void *user_data) {
+    // 处理响应头
+    return 0;
+}
+
+int HttpDownloader::onDataChunkRecvCallback(nghttp2_session *session,
+                                          uint8_t flags, int32_t stream_id,
+                                          const uint8_t *data, size_t len,
+                                          void *user_data) {
+    HttpDownloader *downloader = static_cast<HttpDownloader*>(user_data);
+    fwrite(data, 1, len, downloader->fp);
+    return 0;
 } 

@@ -1,4 +1,4 @@
-# 异步 HTTP 下载器
+# 异步 HTTP 下载器 （网上学的HTTP2.0协议实现）
 
 ## 项目简介
 这是一个基于 epoll 的异步 HTTP 下载器实现，使用非阻塞 I/O 和事件驱动模型来高效下载 HTTP 文件。
@@ -100,9 +100,135 @@ async_downloading/
 └── Makefile           // 编译规则
 ```
 
-## 后续优化方向
-1. 添加 HTTPS 支持
-2. 实现断点续传
-3. 添加下载进度显示
-4. 支持并发下载多个文件
-5. 添加下载速度限制功能
+## HTTP/2 协议实现
+
+### HTTP/2 核心特性
+1. 二进制分帧
+   - 将消息分解为更小的帧
+   - 实现了更高效的消息传输
+   - 本项目使用 nghttp2 库处理二进制帧
+
+2. 多路复用
+   ```cpp
+   nghttp2_settings_entry iv[1] = {
+       {NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, 100}
+   };
+   ```
+   - 在单个 TCP 连接上并行处理多个请求/响应
+   - 解决了 HTTP/1.1 的队头阻塞问题
+   - 通过流(Stream)标识符区分不同请求
+
+3. 服务器推送
+   - 服务器可以主动推送相关资源
+   - 减少客户端请求次数
+   - 提高资源加载效率
+
+4. 头部压缩
+   ```cpp
+   const nghttp2_nv hdrs[] = {
+       {(uint8_t*)":method", (uint8_t*)"GET", 6, 3, NGHTTP2_NV_FLAG_NONE},
+       {(uint8_t*)":path", (uint8_t*)path.c_str(), 5, path.length(), NGHTTP2_NV_FLAG_NONE},
+       // ...
+   };
+   ```
+   - 使用 HPACK 算法压缩头部
+   - 减少带宽使用
+   - 提高传输效率
+
+### 项目中的 HTTP/2 实现
+1. 会话管理
+   ```cpp
+   void initHttp2Session() {
+       nghttp2_session_callbacks *callbacks;
+       nghttp2_session_callbacks_new(&callbacks);
+       // 设置各种回调函数
+       nghttp2_session_client_new(&session, callbacks, this);
+   }
+   ```
+
+2. 流程控制
+   - 初始化 HTTP/2 会话
+   - 发送连接前言(Preface)
+   - 设置初始流控制参数
+   - 处理 SETTINGS 帧
+
+## 异步和并发实现
+
+### 异步特性
+异步是指程序在执行某个操作时，不需要等待该操作完成就可以继续执行其他任务。
+
+本项目的异步体现：
+1. 非阻塞 Socket 操作
+   ```cpp
+   sock_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+   fcntl(sock_fd, F_SETFL, flags | O_NONBLOCK);
+   ```
+   - connect() 不会阻塞等待连接建立
+   - read()/write() 不会阻塞等待数据
+   - 可以立即处理其他任务
+
+2. 事件驱动模型
+   ```cpp
+   int nfds = epoll_wait(epoll_fd, events, 1, timeout);
+   if (events[i].events & EPOLLOUT) {
+       // 处理可写事件
+   }
+   if (events[i].events & EPOLLIN) {
+       // 处理可读事件
+   }
+   ```
+   - 使用 epoll 监听 I/O 事件
+   - 事件触发时才处理相应操作
+   - 避免轮询等待
+
+3. 回调处理
+   ```cpp
+   static ssize_t sendCallback(...);
+   static int onHeaderCallback(...);
+   static int onDataChunkRecvCallback(...);
+   ```
+   - 通过回调函数处理异步操作的结果
+   - 不同类型的数据有独立的处理流程
+   - 提高程序的响应性
+
+### 并发特性
+并发是指多个操作在同一时间段内同时进行。
+
+本项目的并发体现：
+1. HTTP/2 多路复用
+   ```cpp
+   nghttp2_settings_entry iv[1] = {
+       {NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, 100}
+   };
+   ```
+   - 单个连接支持并发处理多个请求
+   - 不同的流可以并行传输
+   - 提高资源利用效率
+
+2. epoll 多事件处理
+   ```cpp
+   struct epoll_event events[1];
+   while (true) {
+       int nfds = epoll_wait(epoll_fd, events, 1, timeout);
+       for (int i = 0; i < nfds; i++) {
+           // 并发处理多个事件
+       }
+   }
+   ```
+   - 同时监听多个文件描述符
+   - 可以并发处理读写事件
+   - 支持高并发连接
+
+### 异步和并发的区别
+1. 概念区别
+   - 异步：关注操作的执行方式（不等待）
+   - 并发：关注操作的执行时机（同时进行）
+
+2. 实现方式
+   - 异步：通过回调、事件通知等机制
+   - 并发：通过多路复用、多线程等技术
+
+3. 优势互补
+   - 异步提高程序响应性
+   - 并发提高系统吞吐量
+   - 结合使用可以达到最佳性能
