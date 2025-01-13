@@ -61,6 +61,11 @@
 
 ## 编译和使用
 
+### 安装环境
+```bash
+sudo apt-get install libnghttp2-dev
+```
+
 ### 编译
 ```bash
 make

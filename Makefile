@@ -1,5 +1,5 @@
 CXX = g++
-CXXFLAGS = -std=c++11 -Wall -Wextra
+CXXFLAGS = -std=c++11 -Wall -Wextra -I/usr/include
 LDFLAGS = -lnghttp2
 
 TARGET = http_downloader
